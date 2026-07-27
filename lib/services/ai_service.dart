@@ -1,8 +1,21 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:developer' as developer;
+import 'dart:io';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import '../models/agent_action.dart';
+import '../models/ai_profile.dart';
+import 'image_attachment_service.dart';
+
+enum ConnectionTestResult {
+  success,
+  unauthorized,
+  notFound,
+  networkError,
+  timeout,
+  otherError,
+}
 
 class AiResponse {
   final String content;
@@ -57,7 +70,56 @@ class AiService {
   int _maxTokens = 1024;
   bool _useScreenCompression = true;
   bool _useSystemPrompt = true;
-  final List<Map<String, String>> _conversationHistory = [];
+  final List<Map<String, dynamic>> _conversationHistory = [];
+  final ImageAttachmentService _imageAttachmentService =
+      ImageAttachmentService();
+
+  /// Model name fragments known to belong to vision-capable models. This is
+  /// only used to log a heads-up when attachments are sent to a model that
+  /// doesn't match — the request is still attempted either way, since this
+  /// list is never exhaustive and the provider's own error is authoritative.
+  static const List<String> _visionModelHints = [
+    'vision',
+    'vl-',
+    'llava',
+    'gpt-4o',
+    'gpt-4.1',
+    'claude-3',
+    'gemini',
+    'pixtral',
+  ];
+
+  bool _modelLikelySupportsVision(String model) {
+    final lower = model.toLowerCase();
+    return _visionModelHints.any(lower.contains);
+  }
+
+  /// Builds the OpenAI/NIM-compatible `content` value for a user message:
+  /// a plain string when there are no attachments, or a content-block list
+  /// (`text` + one `image_url` per attachment) for multimodal turns.
+  Future<dynamic> _buildContent(String text, List<String>? attachmentPaths) async {
+    if (attachmentPaths == null || attachmentPaths.isEmpty) return text;
+
+    if (!_modelLikelySupportsVision(_model)) {
+      developer.log(
+        'Sending ${attachmentPaths.length} attachment(s) to model "$_model", '
+        'which is not in the known vision-model list. Attempting anyway.',
+        name: 'AiService',
+      );
+    }
+
+    final blocks = <Map<String, dynamic>>[
+      {'type': 'text', 'text': text},
+    ];
+    for (final path in attachmentPaths) {
+      final uri = await _imageAttachmentService.toBase64DataUri(path);
+      blocks.add({
+        'type': 'image_url',
+        'image_url': {'url': uri},
+      });
+    }
+    return blocks;
+  }
 
   static const String _systemPrompt = '''
 You are PrivateAgent, a helpful AI assistant that controls an Android phone. You can perform device actions and also have normal conversations.
@@ -208,13 +270,17 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
   }
 
   /// Send a message to the AI and get a response.
-  Future<String> sendMessage(String message, {bool isAgentMode = true}) async {
+  Future<String> sendMessage(
+    String message, {
+    bool isAgentMode = true,
+    List<String>? attachments,
+  }) async {
     if (_apiKey == null || _apiKey!.isEmpty) {
       throw Exception('API Key is not configured. Please go to Settings.');
     }
 
-    // Add ONLY the text to the persistent conversation history to save tokens.
-    _conversationHistory.add({'role': 'user', 'content': message});
+    final content = await _buildContent(message, attachments);
+    _conversationHistory.add({'role': 'user', 'content': content});
 
     // Keep conversation history manageable (last 20 messages)
     if (_conversationHistory.length > 20) {
@@ -323,12 +389,14 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
   Stream<String> sendMessageStream(
     String message, {
     bool isAgentMode = true,
+    List<String>? attachments,
   }) async* {
     if (_apiKey == null || _apiKey!.isEmpty) {
       throw Exception('API Key is not configured. Please go to Settings.');
     }
 
-    _conversationHistory.add({'role': 'user', 'content': message});
+    final content = await _buildContent(message, attachments);
+    _conversationHistory.add({'role': 'user', 'content': content});
 
     if (_conversationHistory.length > 20) {
       _conversationHistory.removeRange(0, _conversationHistory.length - 20);
@@ -651,5 +719,113 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
       print('Error fetching models: $e');
       return [];
     }
+  }
+
+  /// Validates a baseUrl/apiKey pair against the provider's /models endpoint,
+  /// distinguishing failure modes instead of collapsing them all to an empty
+  /// list like [fetchAvailableModels] does.
+  Future<(ConnectionTestResult, String?)> testConnection(
+    String baseUrl,
+    String apiKey,
+  ) async {
+    String cleanBaseUrl = baseUrl.trim();
+    if (cleanBaseUrl.endsWith('/chat/completions')) {
+      cleanBaseUrl = cleanBaseUrl.replaceAll('/chat/completions', '');
+    }
+    if (cleanBaseUrl.endsWith('/')) {
+      cleanBaseUrl = cleanBaseUrl.substring(0, cleanBaseUrl.length - 1);
+    }
+
+    try {
+      final response = await http
+          .get(
+            Uri.parse('$cleanBaseUrl/models'),
+            headers: {'Authorization': 'Bearer $apiKey'},
+          )
+          .timeout(const Duration(seconds: 8));
+
+      switch (response.statusCode) {
+        case 200:
+          return (ConnectionTestResult.success, null);
+        case 401:
+        case 403:
+          return (ConnectionTestResult.unauthorized, null);
+        case 404:
+          return (ConnectionTestResult.notFound, null);
+        default:
+          return (ConnectionTestResult.otherError, '${response.statusCode}');
+      }
+    } on TimeoutException {
+      return (ConnectionTestResult.timeout, null);
+    } on SocketException catch (e) {
+      return (ConnectionTestResult.networkError, e.message);
+    } on http.ClientException catch (e) {
+      return (ConnectionTestResult.networkError, e.message);
+    } catch (e) {
+      return (ConnectionTestResult.otherError, e.toString());
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // Saved provider profiles
+  // ---------------------------------------------------------------------
+
+  static const String _profilesPrefsKey = 'ai_profiles';
+
+  Future<List<AiProfile>> listProfiles() async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString(_profilesPrefsKey);
+    if (raw == null || raw.isEmpty) return [];
+    try {
+      final decoded = jsonDecode(raw) as List;
+      return decoded
+          .map((e) => AiProfile.fromJson(e as Map<String, dynamic>))
+          .toList();
+    } catch (_) {
+      return [];
+    }
+  }
+
+  Future<void> saveProfile(AiProfile profile) async {
+    final prefs = await SharedPreferences.getInstance();
+    final profiles = await listProfiles();
+    final index = profiles.indexWhere((p) => p.id == profile.id);
+    if (index >= 0) {
+      profiles[index] = profile;
+    } else {
+      profiles.add(profile);
+    }
+    await prefs.setString(
+      _profilesPrefsKey,
+      jsonEncode(profiles.map((p) => p.toJson()).toList()),
+    );
+  }
+
+  Future<void> deleteProfile(String id) async {
+    final prefs = await SharedPreferences.getInstance();
+    final profiles = await listProfiles();
+    profiles.removeWhere((p) => p.id == id);
+    await prefs.setString(
+      _profilesPrefsKey,
+      jsonEncode(profiles.map((p) => p.toJson()).toList()),
+    );
+  }
+
+  Future<void> applyProfile(AiProfile profile) async {
+    await saveSettings(
+      apiKey: profile.apiKey,
+      baseUrl: profile.baseUrl,
+      model: profile.model,
+    );
+  }
+
+  AiProfile currentAsProfile(String name) {
+    return AiProfile(
+      id: DateTime.now().millisecondsSinceEpoch.toString(),
+      name: name,
+      apiKey: apiKey,
+      baseUrl: baseUrl,
+      model: model,
+    );
   }
 }

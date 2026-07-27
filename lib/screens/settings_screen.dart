@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../main.dart';
+import '../models/ai_profile.dart';
 import '../services/ai_service.dart';
 import '../services/shizuku_service.dart';
 import '../services/screen_automation_service.dart';
@@ -45,6 +46,8 @@ class _SettingsScreenState extends State<SettingsScreen>
   bool _useSystemPrompt = true;
   bool _floatingIconEnabled = false;
   bool _isOverlayPermissionGranted = false;
+  bool _testingConnection = false;
+  List<AiProfile> _profiles = [];
 
   final Map<String, PermissionStatus> _permissions = {};
 
@@ -79,6 +82,12 @@ class _SettingsScreenState extends State<SettingsScreen>
     if (FeatureFlags.floatingOverlayEnabled) {
       _checkOverlayStatus();
     }
+    _loadProfiles();
+  }
+
+  Future<void> _loadProfiles() async {
+    final profiles = await widget.aiService.listProfiles();
+    if (mounted) setState(() => _profiles = profiles);
   }
 
   Future<void> _checkOverlayStatus() async {
@@ -238,6 +247,132 @@ class _SettingsScreenState extends State<SettingsScreen>
         ),
       );
     }
+  }
+
+  Future<void> _testConnection() async {
+    final baseUrl = _baseUrlController.text.trim();
+    final apiKey = _apiKeyController.text.trim();
+
+    if (baseUrl.isEmpty || apiKey.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Please enter Base URL and API Key first.'),
+        ),
+      );
+      return;
+    }
+
+    setState(() => _testingConnection = true);
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => const Center(child: CircularProgressIndicator()),
+    );
+
+    final (result, detail) = await widget.aiService.testConnection(
+      baseUrl,
+      apiKey,
+    );
+
+    if (mounted) Navigator.pop(context);
+    setState(() => _testingConnection = false);
+    if (!mounted) return;
+
+    String message;
+    Color color;
+    switch (result) {
+      case ConnectionTestResult.success:
+        message = 'Connection successful.';
+        color = Colors.green;
+        break;
+      case ConnectionTestResult.unauthorized:
+        message = 'Connection failed: invalid API key.';
+        color = Colors.redAccent;
+        break;
+      case ConnectionTestResult.notFound:
+        message = 'Connection failed: endpoint not found. Check Base URL.';
+        color = Colors.redAccent;
+        break;
+      case ConnectionTestResult.timeout:
+        message = 'Connection failed: request timed out.';
+        color = Colors.redAccent;
+        break;
+      case ConnectionTestResult.networkError:
+        message = 'Connection failed: network error${detail != null ? ' ($detail)' : ''}.';
+        color = Colors.redAccent;
+        break;
+      case ConnectionTestResult.otherError:
+        message = 'Connection failed${detail != null ? ' (HTTP $detail)' : ''}.';
+        color = Colors.redAccent;
+        break;
+    }
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(message), backgroundColor: color),
+    );
+  }
+
+  Future<void> _saveCurrentAsProfile() async {
+    final nameController = TextEditingController();
+    final name = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Save current config as profile'),
+        content: TextField(
+          controller: nameController,
+          autofocus: true,
+          decoration: const InputDecoration(hintText: 'Profile name'),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, nameController.text.trim()),
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+
+    if (name == null || name.isEmpty) return;
+
+    await widget.aiService.saveProfile(widget.aiService.currentAsProfile(name));
+    await _loadProfiles();
+  }
+
+  Future<void> _applyProfile(AiProfile profile) async {
+    await widget.aiService.applyProfile(profile);
+    setState(() {
+      _apiKeyController.text = profile.apiKey;
+      _baseUrlController.text = profile.baseUrl;
+      _modelController.text = profile.model;
+    });
+  }
+
+  Future<void> _deleteProfile(AiProfile profile) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Delete profile?'),
+        content: Text('Delete "${profile.name}"? This cannot be undone.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+
+    await widget.aiService.deleteProfile(profile.id);
+    await _loadProfiles();
   }
 
   Widget _buildSettingsCard({
@@ -550,6 +685,30 @@ class _SettingsScreenState extends State<SettingsScreen>
                     ),
                   ),
                   const SizedBox(width: 8),
+                  OutlinedButton.icon(
+                    onPressed: _testingConnection ? null : _testConnection,
+                    icon: _testingConnection
+                        ? const SizedBox(
+                            width: 14,
+                            height: 14,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.wifi_tethering_rounded, size: 18),
+                    label: const Text(
+                      'Test',
+                      style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12),
+                    ),
+                    style: OutlinedButton.styleFrom(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 14,
+                        vertical: 14,
+                      ),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
                   ElevatedButton.icon(
                     onPressed: _fetchModels,
                     icon: const Icon(
@@ -579,6 +738,53 @@ class _SettingsScreenState extends State<SettingsScreen>
                   ),
                 ],
               ),
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  Text(
+                    'Saved Profiles',
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.bold,
+                      color: isDark ? Colors.grey[400] : Colors.grey[600],
+                    ),
+                  ),
+                  const Spacer(),
+                  TextButton.icon(
+                    onPressed: _saveCurrentAsProfile,
+                    icon: const Icon(Icons.save_outlined, size: 16),
+                    label: const Text(
+                      'Save current as...',
+                      style: TextStyle(fontSize: 12),
+                    ),
+                  ),
+                ],
+              ),
+              if (_profiles.isNotEmpty)
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 4,
+                  children: [
+                    for (final profile in _profiles)
+                      InputChip(
+                        label: Text(
+                          profile.name,
+                          style: const TextStyle(fontSize: 11),
+                        ),
+                        onPressed: () => _applyProfile(profile),
+                        onDeleted: () => _deleteProfile(profile),
+                        deleteIconColor: Colors.redAccent,
+                      ),
+                  ],
+                )
+              else
+                Text(
+                  'No saved profiles yet.',
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: isDark ? Colors.grey[600] : Colors.grey[400],
+                  ),
+                ),
             ],
           ),
 
