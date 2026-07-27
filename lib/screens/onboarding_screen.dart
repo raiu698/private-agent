@@ -583,12 +583,12 @@ class _OnboardingScreenState extends State<OnboardingScreen>
 
   // --- STEP 1: WELCOME SCREEN ---
   Widget _buildWelcomePage(bool isDark) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 32),
+    return SingleChildScrollView(
+      padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 24),
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
-          const Spacer(flex: 3),
+          const SizedBox(height: 8),
           // Large Custom Glowing Logo Container
           Stack(
             alignment: Alignment.center,
@@ -628,7 +628,7 @@ class _OnboardingScreenState extends State<OnboardingScreen>
               ),
             ],
           ),
-          const Spacer(flex: 2),
+          const SizedBox(height: 28),
           // Clean Title
           Text(
             'PrivateAgent',
@@ -649,7 +649,7 @@ class _OnboardingScreenState extends State<OnboardingScreen>
               height: 1.55,
             ),
           ),
-          const Spacer(flex: 2),
+          const SizedBox(height: 28),
 
           // Custom Sleek Features list
           _buildFeatureCard(
@@ -666,7 +666,7 @@ class _OnboardingScreenState extends State<OnboardingScreen>
             isDark,
           ),
 
-          const Spacer(flex: 3),
+          const SizedBox(height: 32),
           // Get Started button
           Container(
             width: double.infinity,
